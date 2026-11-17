@@ -2,7 +2,9 @@
 
 [返回首页](../README.md)
 
-当前版本：`v0.2.1`。本文保留完整 AI 安装协议、升级与迁移步骤、验收用例和脚本参考。
+当前版本：`v0.3.0`。本文保留完整 AI 安装协议、升级与迁移步骤、验收用例和脚本参考。
+
+安装不移动任何已有内容。要把已有的杂乱内容归入主题，安装后由用户主动要求，按 [整理已有工作区](reorganize.md) 执行。
 
 ## 文件归属
 
@@ -13,9 +15,14 @@
 | `README.md` 中索引标记区块 | 脚本生成 | 由脚本重新生成 |
 | `README.md` 其他内容 | 安装后归用户 | 保留 |
 | `.agents/workspace.md` | Kit | 展示差异后可整体替换 |
+| `.agents/maintenance.md` | Kit | 展示差异后可整体替换 |
+| `.agents/old-chats.md` | Kit | 展示差异后可整体替换 |
 | `.agents/tools/workspace_doctor.py` | Kit | 展示差异后可整体替换 |
 | `.agents/local.md` | 用户 | 不存在时创建，存在时永不覆盖 |
 | `.agents/root-allowlist.txt` | 用户 | 不存在时创建，存在时只经同意追加 |
+| `.agents/adopted.txt` | 用户 | 不随安装创建；首次登记老目录时创建，升级不修改 |
+| `.agents/moves.tsv` | 脚本生成 | 不随安装创建；由 `move` 命令维护，升级不修改，不手工编辑 |
+| `.agents/move-plan.tsv` | 用户/AI | 整理时的临时计划文件，升级不修改 |
 | 各主题入口 | 用户/主题 | 只按任务修改 |
 
 ## AI 安装协议
@@ -24,20 +31,22 @@
 
 ### 1. 获取模板
 
-安装内容以以下六个文件为准：
+安装内容以以下八个文件为准：
 
 | 本仓库中的源文件 | 写入目标工作区的位置 |
 | --- | --- |
 | [workspace-template/AGENTS.md](../workspace-template/AGENTS.md) | `AGENTS.md` |
 | [workspace-template/README.md](../workspace-template/README.md) | `README.md` |
 | [workspace-template/.agents/workspace.md](../workspace-template/.agents/workspace.md) | `.agents/workspace.md` |
+| [workspace-template/.agents/maintenance.md](../workspace-template/.agents/maintenance.md) | `.agents/maintenance.md` |
+| [workspace-template/.agents/old-chats.md](../workspace-template/.agents/old-chats.md) | `.agents/old-chats.md` |
 | [workspace-template/.agents/local.md](../workspace-template/.agents/local.md) | `.agents/local.md` |
 | [workspace-template/.agents/root-allowlist.txt](../workspace-template/.agents/root-allowlist.txt) | `.agents/root-allowlist.txt` |
 | [workspace-template/.agents/tools/workspace_doctor.py](../workspace-template/.agents/tools/workspace_doctor.py) | `.agents/tools/workspace_doctor.py` |
 
-- 能访问本仓库的本地副本时，直接读取上述六个文件。
+- 能访问本仓库的本地副本时，直接读取上述八个文件。
 - 只能联网读取时，使用与用户读取的仓库根 README 相同版本的原始文件：`https://raw.githubusercontent.com/LinyiAIGC/ai-workspace-kit/<ref>/<源文件路径>`。`<ref>` 使用读取 README 时的分支或标签；未指定时使用 `main`。本协议也必须从同一分支或标签读取。
-- 必须读取全部六个文件的实际内容，并按 UTF-8 写入；不要凭首页概述、本协议或记忆重写模板，尤其不要重写检查脚本。
+- 必须读取全部八个文件的实际内容，并按 UTF-8 写入；不要凭首页概述、本协议或记忆重写模板，尤其不要重写检查脚本。
 - 任一文件读取失败时停止，告诉用户缺少哪个文件。
 
 ### 2. 确定目标目录
@@ -52,7 +61,7 @@
 
 列出目标根目录的直接内容，包括隐藏项；读取已存在的 `AGENTS.md`、`README.md` 和相关 `.agents/` 文件。不递归读取用户的全部文件。
 
-安装前已经存在的根目录直接子项保持原位。除默认允许项之外的条目，写入新建的 `.agents/root-allowlist.txt`，不移动这些内容。默认允许项为：`AGENTS.md`、`README.md`、`.agents`、`work`、`archive`、`inbox`、`.git`、`.gitignore`、`.gitattributes`、`CLAUDE.md`、`GEMINI.md`、`.claude`、`.gemini`、`.codex`、`.cursor`、`.vscode`、`.DS_Store`、`Thumbs.db`、`desktop.ini`。
+安装前已经存在的根目录直接子项保持原位。除默认允许项之外的条目，写入新建的 `.agents/root-allowlist.txt`，不移动这些内容；条目较多时写入脚本后运行 `scan --write-allowlist` 完成登记。默认允许项为：`AGENTS.md`、`README.md`、`.agents`、`work`、`archive`、`inbox`、`.git`、`.gitignore`、`.gitattributes`、`CLAUDE.md`、`GEMINI.md`、`.claude`、`.gemini`、`.codex`、`.cursor`、`.vscode`、`.DS_Store`、`Thumbs.db`、`desktop.ini`。
 
 已有文件按下列规则处理：
 
@@ -64,12 +73,12 @@
 | `AGENTS.md` 的 Kit 标记损坏或重复 | 停止并询问，不猜测边界。 |
 | `README.md` 已存在，没有索引标记 | 保留原文，在末尾追加工作区说明和空的主题索引标记区块，随后运行 `index --write`。 |
 | `README.md` 已有索引标记 | 保留标记外内容，按“升级”处理索引区块。 |
-| `.agents/workspace.md` 已存在但不是 Kit 文件 | 停止并询问是合并还是改用其他位置。 |
+| `.agents/workspace.md`、`.agents/maintenance.md` 或 `.agents/old-chats.md` 已存在但不是 Kit 文件 | 停止并询问是合并还是改用其他位置。 |
 | `.agents/tools/workspace_doctor.py` 已存在但不是 Kit 文件 | 停止并询问，不覆盖。 |
 | `.agents/local.md` 已存在 | 永不覆盖。 |
 | `.agents/root-allowlist.txt` 已存在 | 不覆盖；只在用户同意时追加缺失的条目。 |
 
-安装前已经存在的其他文件和目录保持原位。可以提示用户它们尚未整理，但整理和迁移属于另一项任务，需要用户明确要求。
+安装前已经存在的其他文件和目录保持原位。可以提示用户它们尚未整理，并告知可以主动要求按 [整理已有工作区](reorganize.md) 处理；整理不随安装自动进行。
 
 #### 其他 AI 规则文件
 
@@ -91,8 +100,8 @@
 
 ### 4. 写入并接入客户端
 
-- 只写入六个模板文件和第 3 步确定需要的合并内容。
-- 不创建 `work/`、`archive/`、`inbox/`、示例主题或主题内的空子目录。
+- 只写入八个模板文件和第 3 步确定需要的合并内容。
+- 不创建 `work/`、`archive/`、`inbox/`、`.agents/adopted.txt`、`.agents/moves.tsv`、示例主题或主题内的空子目录。
 - 当前客户端会读取目标根目录的 `AGENTS.md` 时，不增加其他入口。
 - 当前客户端不读取 `AGENTS.md` 时，按其当前官方文档创建或配置它自己的项目规则入口，让入口引用或导入 `AGENTS.md`。不要在多个入口中复制完整规则。
 - 无法确认客户端的加载方式时，不猜测配置；告诉用户新聊天开始时需要先让 AI 读取根 `AGENTS.md`。
@@ -113,8 +122,9 @@
 
 目标文件含有 `ai-workspace-kit` 版本标记时，先比较目标与新模板的差异。替换前展示差异摘要。
 
-- 只替换 `AGENTS.md` 的 Kit 标记区块、`.agents/workspace.md` 和 `.agents/tools/workspace_doctor.py` 等 Kit 文件。
-- 保留用户文件、`.agents/local.md`、`.agents/root-allowlist.txt` 的既有条目，以及索引标记外的 README 内容。
+- 只替换 `AGENTS.md` 的 Kit 标记区块、`.agents/workspace.md`、`.agents/maintenance.md`、`.agents/old-chats.md` 和 `.agents/tools/workspace_doctor.py` 等 Kit 文件。
+- 从 v0.2.x 升级时新增 `.agents/maintenance.md` 和 `.agents/old-chats.md`：归档、记录决定和索引细节已从 `workspace.md` 移入 `maintenance.md`，三者需要一起更新。升级不触发整理。用户在 `workspace.md` 中的本地修改先展示差异，再询问是否移入 `.agents/local.md`。
+- 保留用户文件、`.agents/local.md`、`.agents/adopted.txt`、`.agents/moves.tsv`、`.agents/root-allowlist.txt` 的既有条目，以及索引标记外的 README 内容。
 - 不因升级重写主题入口；需要补元数据时，先列出拟修改的主题并取得同意。
 - 版本号相同、差异含义不明或无法区分本地修改时，展示差异并询问。
 - 升级后运行 `check` 和 `index --write`，确认本地规则仍在、索引可重建。
@@ -148,6 +158,8 @@ v0.1.0 的规则是分散的纯文本约定。迁移时：
 | “把这个主题归档。” | 整体移入 `archive/`，`status` 改为 `archived`，同步索引和受影响的链接。 |
 | “升级后我的本地规则还在吗？” | `.agents/local.md` 未被覆盖，Kit 区块和 Kit 文件按差异更新。 |
 
+整理已有工作区和旧对话接续的验收用例见 [整理已有工作区](reorganize.md#整理后验收)。
+
 验收需区分“规则是否已加载”和“模型是否执行了规则”。DeepSeek Harness 的工作区指令插件默认支持根 `AGENTS.md`；观察会话中来源为 `agent-instructions` 的基线消息可以确认是否注入，不能只凭模型自述判断。链接到详细规则不代表这些文件已经自动进入上下文，还需确认 AI 在首次落盘前实际读取了它们。
 
 如果客户端或会话未刷新外部修改，重新开启以目标目录为工作目录的会话，或明确要求 AI 重新读取根规则、流程与本地规则，再运行上面的验收用例。已加载的规则也不构成文件写入拦截，仍需观察行为和检查结果。
@@ -163,16 +175,27 @@ python .agents/tools/workspace_doctor.py check
 python .agents/tools/workspace_doctor.py index
 python .agents/tools/workspace_doctor.py index --write
 python .agents/tools/workspace_doctor.py find <关键词>
+python .agents/tools/workspace_doctor.py scan
+python .agents/tools/workspace_doctor.py scan --write-allowlist
+python .agents/tools/workspace_doctor.py where <旧路径> [<旧路径> ...]
+python .agents/tools/workspace_doctor.py move --plan <计划文件> [--apply]
+python .agents/tools/workspace_doctor.py move --undo
 python .agents/tools/workspace_doctor.py --version
 ```
 
 命令示例统一写 `python`；按环境依次尝试 `python3`、`python`、`py -3`。
 
-- `check` 只读检查根目录、主题入口、元数据、重复标题/别名、索引和相对链接。
+- `check` 只读检查根目录、主题入口、元数据、`.agents/adopted.txt` 中的登记路径、重复标题/别名、索引和相对链接。
 - `index` 显示索引是否需要更新和生成内容；`--write` 只替换索引标记区块。索引表包含主题、入口、状态、标签四列，按状态顺序、再按标题排序，不含更新日期。
 - `index --write` 只写入元数据有效的主题；写入后若仍有主题元数据错误，返回 `1`。
-- `find` 按标题、别名、标签、目录名和入口一级标题做不区分大小写的包含匹配；多个关键词以空白分隔且全部命中才匹配，整句精确匹配优先。
-- `--version` 输出当前脚本版本 `v0.2.1`。
+- `find` 按标题、别名、标签、目录名（原地主题为登记路径）和入口一级标题做不区分大小写的包含匹配；多个关键词以空白分隔且全部命中才匹配，整句精确匹配优先。
+- `scan [<子目录>]` 清点根目录中管理文件以外的直接子项（给出子目录时清点该目录的下一层）：文件数（单个目录最多统计 5000 个）、体积、最近修改日期、登记状态和标记。标记为 `git`、`project`、`agent`（含 `AGENTS.md`、`.agents/`、`SKILL.md` 等）、`env`（含虚拟环境）、`cache`（缓存目录）、`abspath`（有文件写死了本工作区的绝对路径，附最多 3 个文件名）。绝对路径检查在脚本内部比对不超过 2 MB 的文件，大小写和斜杠写法不敏感，不输出文件内容；跳过 `.git`、`node_modules`、虚拟环境和 `__pycache__`。`--limit <N>` 控制目录和文件各自列出的条数，默认 40。
+- `scan --write-allowlist` 把未登记的条目追加到 `.agents/root-allowlist.txt`，不移动任何内容。
+- `where` 按 `.agents/moves.tsv` 把旧路径（相对路径或工作区内的绝对路径）换算成现在的位置，可一次查询多个；有路径不存在时返回 `1`。
+- `move --plan` 读取每行 `原路径<TAB>新路径` 的计划并校验：原路径存在、新路径不存在、不涉及管理文件、条目之间不嵌套；默认只校验，加 `--apply` 才移动，并把每项写入 `.agents/moves.tsv`。计划有问题时不移动任何内容并返回 `1`；执行中途失败返回 `2`，已完成的部分保留记录。
+- `move --undo` 把最近一批移动按相反顺序移回并删除对应记录；原位置已被占用时停止。
+- 会写文件的命令只有 `index --write`、`scan --write-allowlist`、`move --apply` 和 `move --undo`。
+- `--version` 输出当前脚本版本 `v0.3.0`。
 - 脚本只使用 Python 3.9+ 标准库；从其他目录运行时可用 `--root <路径>` 指定工作区。
 
 退出码：`0` 成功且检查无错误；`1` 检查有错误、未写入时索引过期，或 `index --write` 后仍有主题元数据错误；`2` 参数、根目录或文件读写错误。警告不导致退出码 `1`。

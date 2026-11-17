@@ -354,7 +354,255 @@ class WorkspaceDoctorTests(unittest.TestCase):
             init_workspace(root)
             result = run_doctor(root, "--version")
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-            self.assertIn("workspace_doctor v0.2.1", result.stdout)
+            self.assertIn("workspace_doctor v0.3.0", result.stdout)
+
+    def make_adopted(self, root, rel, title, **kwargs):
+        topic_dir = make_topic(root, "", rel, title, entry_name="CONTEXT.md", **kwargs)
+        adopted = root / ".agents" / "adopted.txt"
+        previous = read_text(adopted) if adopted.exists() else "# adopted\n"
+        write_text(adopted, previous + rel + "\n")
+        return topic_dir
+
+    def test_adopted_topic_is_indexed_found_and_allowed_in_place(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            init_workspace(root)
+            write_text(root / "old-app" / "README.md", "# Old App\n\nproject readme without front matter\n")
+            self.make_adopted(root, "old-app", "老应用", aliases=["legacy app"])
+            self.make_adopted(root, "projects/api", "接口服务")
+
+            write_result = run_doctor(root, "index", "--write")
+            self.assertEqual(write_result.returncode, 0, write_result.stderr + write_result.stdout)
+            readme = read_text(root / "README.md")
+            self.assertIn("(old-app/CONTEXT.md)", readme)
+            self.assertIn("(projects/api/CONTEXT.md)", readme)
+
+            result, data = run_json(root, "check")
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(data["warnings"], [])
+
+            _, by_alias = run_json(root, "find", "legacy")
+            self.assertEqual(by_alias["results"][0]["entry"], "old-app/CONTEXT.md")
+            _, by_path = run_json(root, "find", "projects/api")
+            self.assertEqual(by_path["results"][0]["title"], "接口服务")
+            self.assertEqual(read_text(root / "old-app" / "README.md"), "# Old App\n\nproject readme without front matter\n")
+
+    def test_adopted_registry_errors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            init_workspace(root)
+            make_topic(root, "work", "kept", "Kept")
+            (root / "no-entry").mkdir()
+            write_text(
+                root / ".agents" / "adopted.txt",
+                "gone\n../outside\nwork/kept\nno-entry\n",
+            )
+            run_doctor(root, "index", "--write")
+            result, data = run_json(root, "check")
+            self.assertEqual(result.returncode, 1)
+            codes = sorted(item["code"] for item in data["errors"])
+            self.assertEqual(codes, ["adopted_invalid", "adopted_invalid", "adopted_missing", "missing_entry"])
+
+    def test_adopted_topic_cannot_be_archived(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            init_workspace(root)
+            self.make_adopted(root, "old-app", "老应用", status="archived")
+            _, data = run_json(root, "check")
+            self.assertIn("status_location_conflict", [item["code"] for item in data["errors"]])
+
+    def test_scan_lists_existing_content_without_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            init_workspace(root)
+            write_text(root / "old-app" / "AGENTS.md", "rules\n")
+            write_text(root / "old-app" / "package.json", "{}\n")
+            write_text(root / "old-app" / "src" / "main.js", "x\n")
+            write_text(root / "old-app" / "node_modules" / "dep" / "index.js", "skipped\n")
+            (root / "old-app" / ".git").mkdir()
+            write_text(root / "notes.txt", "note\n")
+            before = read_text(root / ".agents" / "root-allowlist.txt")
+
+            result, data = run_json(root, "scan")
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertEqual(data["unregistered"], ["notes.txt", "old-app"])
+            directory = data["directories"][0]
+            self.assertEqual(directory["name"], "old-app")
+            self.assertEqual(directory["files"], 3)
+            self.assertEqual(directory["markers"], ["git", "project", "agent"])
+            self.assertEqual(data["files"][0]["name"], "notes.txt")
+            self.assertEqual(data["written"], 0)
+            self.assertEqual(read_text(root / ".agents" / "root-allowlist.txt"), before)
+
+            text_result = run_doctor(root, "scan", "--limit", "0")
+            self.assertEqual(text_result.returncode, 0)
+            self.assertIn("未登记 2 个", text_result.stdout)
+            self.assertNotIn("- old-app/", text_result.stdout)
+
+    def test_scan_write_allowlist_appends_once_and_keeps_content(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            init_workspace(root)
+            write_text(root / ".agents" / "root-allowlist.txt", "# user allowlist\nkept-item")
+            write_text(root / "old-app" / "main.py", "print(1)\n")
+            write_text(root / "notes.txt", "note\n")
+            self.make_adopted(root, "legacy", "Legacy")
+
+            result, data = run_json(root, "scan", "--write-allowlist")
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertEqual(data["written"], 2)
+            self.assertEqual(
+                read_text(root / ".agents" / "root-allowlist.txt"),
+                "# user allowlist\nkept-item\nnotes.txt\nold-app\n",
+            )
+            states = {item["name"]: item["state"] for item in data["directories"]}
+            self.assertEqual(states, {"legacy": "adopted", "old-app": "allowlisted"})
+
+            _, again = run_json(root, "scan", "--write-allowlist")
+            self.assertEqual(again["written"], 0)
+            self.assertEqual(again["unregistered"], [])
+            self.assertTrue((root / "old-app" / "main.py").is_file())
+
+            run_doctor(root, "index", "--write")
+            check_result, check_data = run_json(root, "check")
+            self.assertEqual(check_result.returncode, 0, check_result.stdout)
+            self.assertEqual(check_data["warnings"], [])
+
+    def make_messy_workspace(self, root):
+        init_workspace(root)
+        write_text(root / "a.txt", "a\n")
+        write_text(root / "报告 final.docx", "b\n")
+        write_text(root / "新建文件夹 (2)" / "x" / "c.md", "c\n")
+        write_text(root / "proj" / "main.py", "d\n")
+
+    def write_plan(self, root, lines):
+        write_text(root / ".agents" / "move-plan.tsv", "# plan\n" + "\n".join(lines) + "\n")
+        return ".agents/move-plan.tsv"
+
+    def test_move_dry_run_then_apply_records_and_where_resolves(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_messy_workspace(root)
+            plan = self.write_plan(
+                root,
+                [
+                    "a.txt\twork/2026-01-01-misc/a.txt",
+                    "报告 final.docx -> work/2026-01-01-misc/报告 final.docx",
+                    "新建文件夹 (2)\twork/2026-02-02-notes",
+                ],
+            )
+
+            dry, dry_data = run_json(root, "move", "--plan", plan)
+            self.assertEqual(dry.returncode, 0, dry.stdout)
+            self.assertFalse(dry_data["applied"])
+            self.assertTrue((root / "a.txt").is_file())
+            self.assertFalse((root / ".agents" / "moves.tsv").exists())
+
+            applied, applied_data = run_json(root, "move", "--plan", plan, "--apply")
+            self.assertEqual(applied.returncode, 0, applied.stdout)
+            self.assertEqual(len(applied_data["moved"]), 3)
+            self.assertFalse((root / "a.txt").exists())
+            self.assertEqual(read_text(root / "work" / "2026-02-02-notes" / "x" / "c.md"), "c\n")
+
+            result, data = run_json(
+                root, "where", "新建文件夹 (2)\\x\\c.md", str(root / "a.txt"), "proj/main.py", "gone.txt"
+            )
+            self.assertEqual(result.returncode, 1)
+            by_query = {item["query"]: item for item in data["results"]}
+            self.assertEqual(by_query["新建文件夹 (2)/x/c.md"]["current"], "work/2026-02-02-notes/x/c.md")
+            self.assertEqual(by_query["a.txt"]["current"], "work/2026-01-01-misc/a.txt")
+            self.assertFalse(by_query["proj/main.py"]["moved"])
+            self.assertTrue(by_query["proj/main.py"]["exists"])
+            self.assertFalse(by_query["gone.txt"]["exists"])
+
+    def test_move_chain_is_followed_and_undo_restores_last_batch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_messy_workspace(root)
+            first = self.write_plan(root, ["proj\twork/2026-01-01-proj"])
+            self.assertEqual(run_doctor(root, "move", "--plan", first, "--apply").returncode, 0)
+            second = self.write_plan(root, ["work/2026-01-01-proj/main.py\twork/2026-03-03-tools/main.py"])
+            self.assertEqual(run_doctor(root, "move", "--plan", second, "--apply").returncode, 0)
+
+            _, data = run_json(root, "where", "proj/main.py")
+            self.assertEqual(data["results"][0]["current"], "work/2026-03-03-tools/main.py")
+
+            undo, undo_data = run_json(root, "move", "--undo")
+            self.assertEqual(undo.returncode, 0, undo.stdout)
+            self.assertEqual(len(undo_data["moved"]), 1)
+            self.assertTrue((root / "work" / "2026-01-01-proj" / "main.py").is_file())
+            _, after = run_json(root, "where", "proj/main.py")
+            self.assertEqual(after["results"][0]["current"], "work/2026-01-01-proj/main.py")
+
+    def test_move_rejects_invalid_plan_without_moving_anything(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_messy_workspace(root)
+            write_text(root / "taken.txt", "keep\n")
+            plan = self.write_plan(
+                root,
+                [
+                    "a.txt\twork/ok/a.txt",
+                    "proj\tproj/sub",
+                    "missing\twork/x",
+                    "AGENTS.md\twork/y",
+                    "报告 final.docx\ttaken.txt",
+                    "proj/main.py\twork/z.py",
+                    "proj\twork/p",
+                    "a.txt\t../outside.txt",
+                    "新建文件夹 (2)\t.agents/hidden",
+                ],
+            )
+            result, data = run_json(root, "move", "--plan", plan, "--apply")
+            self.assertEqual(result.returncode, 1)
+            self.assertFalse(data["applied"])
+            self.assertEqual({item["code"] for item in data["errors"]}, {"plan_invalid"})
+            self.assertEqual(len(data["errors"]), 7)
+            self.assertTrue((root / "a.txt").is_file())
+            self.assertEqual(read_text(root / "taken.txt"), "keep\n")
+            self.assertFalse((root / ".agents" / "moves.tsv").exists())
+            self.assertFalse((root / "work").exists())
+
+    def test_scan_marks_abspath_env_cache_and_nested_workspace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            init_workspace(root)
+            backslash = str(root).replace("/", "\\")
+            write_text(root / "kepu" / "SKILL.md", "run {}\\bin\\x.mjs\n".format(backslash.upper()))
+            write_text(root / "kepu" / ".venv" / "pyvenv.cfg", "home = x\n")
+            write_text(root / "kepu" / "data.json", '{"p": "%s"}\n' % backslash.replace("\\", "\\\\"))
+            write_text(root / "plain" / "a.txt", "nothing here\n")
+            write_text(root / "deep" / "tools" / "runtime" / ".venv" / "pyvenv.cfg", "home = x\n")
+            write_text(root / ".npm-cache" / "_logs" / "d.log", "cwd {}\n".format(str(root).replace("\\", "/")))
+            write_text(root / "loose.md", "see {}\n".format(backslash))
+            write_text(root / "other.md", "see {}2\n".format(backslash[:-1]))
+
+            result, data = run_json(root, "scan")
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            dirs = {item["name"]: item for item in data["directories"]}
+            self.assertEqual(dirs["kepu"]["markers"], ["agent", "env", "abspath"])
+            self.assertEqual(dirs["kepu"]["abspath_files"], 2)
+            self.assertEqual(dirs["plain"]["markers"], [])
+            self.assertEqual(dirs["deep"]["markers"], ["env"])
+            self.assertEqual(dirs[".npm-cache"]["markers"], ["cache", "abspath"])
+            files = {item["name"]: item for item in data["files"]}
+            self.assertEqual(files["loose.md"]["markers"], ["abspath"])
+            self.assertEqual(files["other.md"]["markers"], [])
+
+            text = run_doctor(root, "scan").stdout
+            self.assertIn("写死绝对路径的文件 2 个", text)
+            self.assertNotIn("x.mjs", text)
+
+    def test_scan_subdirectory_lists_next_level_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_messy_workspace(root)
+            result, data = run_json(root, "scan", "新建文件夹 (2)")
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertEqual([item["name"] for item in data["directories"]], ["x"])
+            self.assertEqual(data["files"], [])
+            self.assertEqual(data["unregistered"], [])
+            self.assertEqual(run_doctor(root, "scan", "nope").returncode, 2)
 
 
 if __name__ == "__main__":

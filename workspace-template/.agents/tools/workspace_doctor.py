@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""检查、生成和查询 AI 工作区主题索引。
+"""检查、生成和查询 AI 工作区主题索引，并清点已有工作区。
 
 只使用 Python 3.9+ 标准库。脚本默认假设自己位于
 <工作区根>/.agents/tools/workspace_doctor.py，也可以用 --root 指定根目录。
@@ -22,7 +22,44 @@ from urllib.parse import unquote
 
 START_MARKER = "<!-- ai-workspace-kit:topic-index:start -->"
 END_MARKER = "<!-- ai-workspace-kit:topic-index:end -->"
-KIT_VERSION = "v0.2.1"
+KIT_VERSION = "v0.3.0"
+ADOPTED_FILE = "adopted.txt"
+ALLOWLIST_FILE = "root-allowlist.txt"
+MOVES_FILE = "moves.tsv"
+MOVES_HEADER = "# ai-workspace-kit 移动记录：批次<TAB>原路径<TAB>现路径。由 move 命令维护，供 where 查询，不手工编辑。"
+PROTECTED_ROOTS = {"agents.md", "readme.md", ".agents", ".git", "work", "archive"}
+RESERVED_ROOTS = {"work", "archive", ".agents"}
+
+SCAN_SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__"}
+SCAN_FILE_CAP = 5000
+PROJECT_MARKERS = {
+    "package.json",
+    "pyproject.toml",
+    "requirements.txt",
+    "setup.py",
+    "cargo.toml",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "cmakelists.txt",
+    "makefile",
+}
+ENV_MARKERS = {".venv", "venv", "pyvenv.cfg", ".conda", "conda-meta"}
+CACHE_NAMES = {".cache", "cache", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".gradle"}
+ABSPATH_MAX_BYTES = 2 * 1024 * 1024
+ABSPATH_EXAMPLES = 3
+AGENT_MARKERS = {
+    ".agents",
+    "skill.md",
+    "agents.md",
+    "claude.md",
+    "gemini.md",
+    ".claude",
+    ".codex",
+    ".gemini",
+    ".cursor",
+    ".cursorrules",
+}
 
 DEFAULT_ROOT_ENTRIES = {
     "AGENTS.md",
@@ -277,6 +314,8 @@ def validate_topic(topic: Topic, root: Path) -> None:
     if isinstance(status, str) and status in STATUS_ORDER:
         if topic.section == "work" and status == "archived":
             topic.errors.append(make_issue("status_location_conflict", entry_rel, "work/ 中的主题不能是 archived"))
+        if topic.section == "adopted" and status == "archived":
+            topic.errors.append(make_issue("status_location_conflict", entry_rel, "原地登记的主题不能是 archived"))
         if topic.section == "archive" and status != "archived":
             topic.errors.append(make_issue("status_location_conflict", entry_rel, "archive/ 中的主题必须是 archived"))
 
@@ -314,8 +353,7 @@ def scan_topics(root: Path) -> Tuple[List[Topic], List[Dict[str, str]], List[Dic
                 )
                 continue
 
-            directory = Path(entry.path)
-            topic = Topic(section=section, directory=directory, name=entry.name)
+            topic = Topic(section=section, directory=Path(entry.path), name=entry.name)
             if any(char.isspace() for char in entry.name) or any(char in INVALID_NAME_CHARS for char in entry.name):
                 topic.warnings.append(
                     make_issue(
@@ -324,36 +362,95 @@ def scan_topics(root: Path) -> Tuple[List[Topic], List[Dict[str, str]], List[Dic
                         "主题目录名包含空白或特殊字符",
                     )
                 )
-
-            context = directory / "CONTEXT.md"
-            readme = directory / "README.md"
-            if safe_is_file(root, context):
-                topic.entry = context
-            elif safe_is_file(root, readme):
-                topic.entry = readme
-
-            if topic.entry is None:
-                topic.errors.append(
-                    make_issue(
-                        "missing_entry",
-                        relative_path(root, directory),
-                        "主题缺少 CONTEXT.md 或 README.md 入口",
-                    )
-                )
-            else:
-                entry_rel = relative_path(root, topic.entry)
-                meta, h1, front_matter_errors = parse_front_matter(topic.entry, entry_rel)
-                topic.meta = meta
-                topic.h1 = h1
-                topic.errors.extend(front_matter_errors)
-
-            if topic.entry is not None:
-                validate_topic(topic, root)
+            load_topic_entry(topic, root)
             topics.append(topic)
             errors.extend(topic.errors)
             warnings.extend(topic.warnings)
 
+    adopted, adopted_errors = load_adopted(root)
+    errors.extend(adopted_errors)
+    for rel, directory in adopted:
+        # 原地主题沿用老目录的名称，不检查命名。
+        topic = Topic(section="adopted", directory=directory, name=rel)
+        load_topic_entry(topic, root)
+        topics.append(topic)
+        errors.extend(topic.errors)
+        warnings.extend(topic.warnings)
+
     return topics, errors, warnings
+
+
+def load_topic_entry(topic: Topic, root: Path) -> None:
+    context = topic.directory / "CONTEXT.md"
+    readme = topic.directory / "README.md"
+    if safe_is_file(root, context):
+        topic.entry = context
+    elif safe_is_file(root, readme):
+        topic.entry = readme
+
+    if topic.entry is None:
+        topic.errors.append(
+            make_issue(
+                "missing_entry",
+                relative_path(root, topic.directory),
+                "主题缺少 CONTEXT.md 或 README.md 入口",
+            )
+        )
+        return
+    entry_rel = relative_path(root, topic.entry)
+    meta, h1, front_matter_errors = parse_front_matter(topic.entry, entry_rel)
+    topic.meta = meta
+    topic.h1 = h1
+    topic.errors.extend(front_matter_errors)
+    validate_topic(topic, root)
+
+
+def read_list_file(path: Path) -> List[str]:
+    if not path.exists():
+        return []
+    if not path.is_file():
+        raise WorkspaceError("{} 不是文件".format(path))
+    text = read_text(path)
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    values: List[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            values.append(stripped)
+    return values
+
+
+def load_adopted(root: Path) -> Tuple[List[Tuple[str, Path]], List[Dict[str, str]]]:
+    """读取 .agents/adopted.txt：每行一个保持原位的老目录（相对工作区根）。"""
+    source = ".agents/{}".format(ADOPTED_FILE)
+    entries: List[Tuple[str, Path]] = []
+    errors: List[Dict[str, str]] = []
+    seen = set()
+    for raw in read_list_file(root / ".agents" / ADOPTED_FILE):
+        parts = [part for part in raw.replace("\\", "/").split("/") if part not in ("", ".")]
+        absolute = raw.startswith(("/", "\\")) or (bool(parts) and ":" in parts[0])
+        if not parts or absolute or ".." in parts:
+            errors.append(make_issue("adopted_invalid", source, "必须是工作区内的相对目录路径: {}".format(raw)))
+            continue
+        if parts[0].casefold() in RESERVED_ROOTS:
+            errors.append(
+                make_issue("adopted_invalid", source, "work/、archive/ 和 .agents/ 内的目录不需要登记: {}".format(raw))
+            )
+            continue
+        rel = "/".join(parts)
+        if rel.casefold() in seen:
+            continue
+        seen.add(rel.casefold())
+        directory = root.joinpath(*parts)
+        if directory.is_symlink() or not path_within_root(root, directory):
+            errors.append(make_issue("adopted_invalid", source, "登记的目录不能是链接或位于工作区之外: {}".format(raw)))
+            continue
+        if not directory.is_dir():
+            errors.append(make_issue("adopted_missing", source, "登记的目录不存在，可能已被移动或删除: {}".format(raw)))
+            continue
+        entries.append((rel, directory))
+    return entries, errors
 
 
 def duplicate_warnings(topics: Iterable[Topic], root: Path) -> List[Dict[str, str]]:
@@ -394,17 +491,15 @@ def duplicate_warnings(topics: Iterable[Topic], root: Path) -> List[Dict[str, st
 
 
 def load_allowlist(root: Path) -> List[str]:
-    path = root / ".agents" / "root-allowlist.txt"
-    if not path.exists():
-        return []
-    if not path.is_file():
-        raise WorkspaceError("{} 不是文件".format(path))
-    values: List[str] = []
-    for line in read_text(path).splitlines():
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#"):
-            values.append(stripped)
-    return values
+    return read_list_file(root / ".agents" / ALLOWLIST_FILE)
+
+
+def registered_root_names(root: Path) -> Tuple[set, set]:
+    """返回（白名单条目, 原地主题所在的根目录条目），均为 casefold 后的名称。"""
+    allowlisted = {item.casefold() for item in load_allowlist(root)}
+    adopted, _ = load_adopted(root)
+    adopted_roots = {rel.split("/", 1)[0].casefold() for rel, _ in adopted}
+    return allowlisted, adopted_roots
 
 
 def escape_cell(value: str) -> str:
@@ -613,7 +708,9 @@ def check_command(root: Path, json_output: bool) -> int:
     warnings: List[Dict[str, str]] = []
 
     allowed = {item.casefold() for item in DEFAULT_ROOT_ENTRIES}
-    allowed.update(item.casefold() for item in load_allowlist(root))
+    allowlisted, adopted_roots = registered_root_names(root)
+    allowed.update(allowlisted)
+    allowed.update(adopted_roots)
     try:
         with os.scandir(root) as iterator:
             root_entries = sorted(iterator, key=lambda item: item.name.casefold())
@@ -861,6 +958,509 @@ def find_command(root: Path, query: str, json_output: bool) -> int:
     return 0
 
 
+def format_size(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return "{} {}".format(int(value), unit) if unit == "B" else "{:.1f} {}".format(value, unit)
+        value /= 1024
+    return "{} B".format(size)
+
+
+def format_date(timestamp: float) -> str:
+    if not timestamp:
+        return "-"
+    try:
+        return _datetime.date.fromtimestamp(timestamp).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return "-"
+
+
+def abspath_needles(root: Path) -> List[bytes]:
+    """工作区绝对路径的几种常见写法（正斜杠、反斜杠、JSON 转义），统一为小写字节。"""
+    text = str(root)
+    variants = {text, text.replace("\\", "/"), text.replace("/", "\\"), text.replace("\\", "\\\\")}
+    needles = []
+    for value in variants:
+        stripped = value.rstrip("/\\")
+        # 根目录太短（如磁盘根）时任何文件都会命中，不做检查。
+        if len(stripped) >= 4:
+            needles.append(stripped.casefold().encode("utf-8"))
+    return sorted(set(needles))
+
+
+def file_mentions(path: str, needles: Sequence[bytes]) -> bool:
+    """只在脚本内部比对字节，不输出文件内容。"""
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(ABSPATH_MAX_BYTES)
+    except OSError:
+        return False
+    data = data.lower()
+    return any(needle in data for needle in needles)
+
+
+def is_cache_name(name: str) -> bool:
+    key = name.casefold()
+    return key in CACHE_NAMES or key.endswith(("-cache", "_cache", ".cache"))
+
+
+def summarize_directory(path: Path, root: Optional[Path] = None, needles: Sequence[bytes] = ()) -> Dict[str, object]:
+    """统计目录的文件数、体积和最近修改时间，并检查是否有文件写死工作区绝对路径。
+
+    不进入链接；文件内容只在脚本内比对，不输出。
+    """
+    markers: List[str] = []
+    try:
+        children = {name.casefold() for name in os.listdir(path)}
+    except OSError:
+        children = set()
+    if ".git" in children:
+        markers.append("git")
+    if children & PROJECT_MARKERS:
+        markers.append("project")
+    if children & AGENT_MARKERS:
+        markers.append("agent")
+    if children & ENV_MARKERS:
+        markers.append("env")
+    if is_cache_name(path.name):
+        markers.append("cache")
+
+    files = 0
+    size = 0
+    latest = 0.0
+    truncated = False
+    abspath_files = 0
+    examples: List[str] = []
+    has_env = "env" in markers
+    for current, directories, names in os.walk(path, followlinks=False):
+        if not has_env and any(name.casefold() in ENV_MARKERS for name in list(directories) + names):
+            has_env = True
+        directories[:] = [name for name in directories if name.casefold() not in SCAN_SKIP_DIRS]
+        for name in names:
+            full = os.path.join(current, name)
+            try:
+                stat = os.lstat(full)
+            except OSError:
+                continue
+            files += 1
+            size += stat.st_size
+            latest = max(latest, stat.st_mtime)
+            if needles and stat.st_size <= ABSPATH_MAX_BYTES and file_mentions(full, needles):
+                abspath_files += 1
+                if len(examples) < ABSPATH_EXAMPLES:
+                    examples.append(relative_path(root, Path(full)) if root else full)
+            if files >= SCAN_FILE_CAP:
+                truncated = True
+                break
+        if truncated:
+            break
+    if has_env and "env" not in markers:
+        markers.insert(len([m for m in markers if m in ("git", "project", "agent")]), "env")
+    if abspath_files:
+        markers.append("abspath")
+    return {
+        "files": files,
+        "bytes": size,
+        "modified": format_date(latest),
+        "truncated": truncated,
+        "markers": markers,
+        "abspath_files": abspath_files,
+        "abspath_examples": examples,
+    }
+
+
+def normalize_rel(root: Path, raw: str) -> Optional[str]:
+    """把相对路径或工作区内的绝对路径规范成相对根目录的 posix 路径；无效时返回 None。"""
+    text = raw.strip().strip('"').strip("'")
+    if not text:
+        return None
+    if Path(text).is_absolute():
+        try:
+            text = Path(text).resolve(strict=False).relative_to(root).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            return None
+    parts = [part for part in text.replace("\\", "/").split("/") if part not in ("", ".")]
+    if not parts or ".." in parts or ":" in parts[0]:
+        return None
+    return "/".join(parts)
+
+
+def load_moves(root: Path) -> List[Tuple[str, str, str]]:
+    moves: List[Tuple[str, str, str]] = []
+    for line in read_list_file(root / ".agents" / MOVES_FILE):
+        fields = line.split("\t")
+        if len(fields) == 3 and all(fields):
+            moves.append((fields[0], fields[1], fields[2]))
+    return moves
+
+
+def resolve_moved(moves: Sequence[Tuple[str, str, str]], rel: str) -> str:
+    """按移动记录的先后顺序，把旧路径换算成现在的路径。"""
+    current = rel
+    for _, old, new in moves:
+        folded = current.casefold()
+        if folded == old.casefold():
+            current = new
+        elif folded.startswith(old.casefold() + "/"):
+            current = new + current[len(old) :]
+    return current
+
+
+def where_command(root: Path, paths: Sequence[str], json_output: bool) -> int:
+    moves = load_moves(root)
+    results: List[Dict[str, object]] = []
+    for raw in paths:
+        rel = normalize_rel(root, raw)
+        if rel is None:
+            results.append({"query": raw, "current": "", "moved": False, "exists": False, "valid": False})
+            continue
+        current = resolve_moved(moves, rel)
+        results.append(
+            {
+                "query": rel,
+                "current": current,
+                "moved": current != rel,
+                "exists": os.path.lexists(str(root.joinpath(*current.split("/")))),
+                "valid": True,
+            }
+        )
+    missing = [item for item in results if not item["exists"]]
+    if json_output:
+        print(json.dumps({"ok": not missing, "results": results}, ensure_ascii=False, indent=2))
+    else:
+        for item in results:
+            if not item["valid"]:
+                print("- {}: 不是工作区内的路径".format(item["query"]))
+            elif item["moved"]:
+                print("- {} -> {}{}".format(item["query"], item["current"], "" if item["exists"] else "（记录的新位置已不存在）"))
+            elif item["exists"]:
+                print("- {}: 仍在原位，无移动记录".format(item["query"]))
+            else:
+                print("- {}: 无移动记录，且该路径不存在；可用 find 按主题查找".format(item["query"]))
+    return 1 if missing else 0
+
+
+def parse_move_plan(root: Path, plan: Path) -> Tuple[List[Tuple[str, str]], List[Dict[str, str]]]:
+    plan_rel = relative_path(root, plan)
+    pairs: List[Tuple[str, str]] = []
+    issues: List[Dict[str, str]] = []
+    text = read_text(plan)
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    for number, line in enumerate(text.splitlines(), start=1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        fields = line.split("\t") if "\t" in line else line.split(" -> ")
+        source = normalize_rel(root, fields[0]) if len(fields) == 2 else None
+        target = normalize_rel(root, fields[1]) if len(fields) == 2 else None
+        if source is None or target is None:
+            issues.append(
+                make_issue("plan_invalid", plan_rel, "第 {} 行应为“原路径<TAB>新路径”，且都在工作区内".format(number))
+            )
+            continue
+        pairs.append((source, target))
+
+    def inside(child: str, parent: str) -> bool:
+        return child.casefold().startswith(parent.casefold() + "/")
+
+    targets = set()
+    for source, target in pairs:
+        label = "{} -> {}".format(source, target)
+        source_path = root.joinpath(*source.split("/"))
+        target_path = root.joinpath(*target.split("/"))
+        source_root = source.split("/")[0].casefold()
+        target_root = target.split("/")[0].casefold()
+        problem = ""
+        if (source.casefold() in PROTECTED_ROOTS and "/" not in source) or source_root in (".agents", ".git"):
+            problem = "不能移动工作区管理文件或目录"
+        elif not os.path.lexists(str(source_path)):
+            problem = "原路径不存在"
+        elif target_root in (".agents", ".git") or (target.casefold() in PROTECTED_ROOTS and "/" not in target):
+            problem = "新路径不能是工作区管理文件或位于 .agents/、.git/ 内"
+        elif source.casefold() == target.casefold() or inside(target, source):
+            problem = "新路径不能与原路径相同或位于原路径内部"
+        elif os.path.lexists(str(target_path)):
+            problem = "新路径已存在，不覆盖"
+        elif target.casefold() in targets:
+            problem = "新路径在计划中重复"
+        elif any(other != source and inside(source, other) for other, _ in pairs):
+            problem = "原路径位于计划中另一个要移动的目录内"
+        elif any(inside(target, other) for other, _ in pairs):
+            problem = "新路径位于计划中要移动的目录内"
+        else:
+            ancestor = target_path.parent
+            while ancestor != root and not os.path.lexists(str(ancestor)):
+                ancestor = ancestor.parent
+            if not ancestor.is_dir() or not path_within_root(root, ancestor):
+                problem = "新路径的上级不是工作区内的目录"
+        targets.add(target.casefold())
+        if problem:
+            issues.append(make_issue("plan_invalid", plan_rel, "{}: {}".format(label, problem)))
+    return pairs, issues
+
+
+def write_moves(root: Path, moves: Sequence[Tuple[str, str, str]]) -> None:
+    path = root / ".agents" / MOVES_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [MOVES_HEADER] + ["\t".join(item) for item in moves]
+    atomic_write(path, "\n".join(lines) + "\n")
+
+
+def move_command(root: Path, plan_value: Optional[str], apply: bool, undo: bool, json_output: bool) -> int:
+    """按计划移动已有内容并写入移动记录；默认只校验，不移动。"""
+    moves = load_moves(root)
+    done: List[Tuple[str, str]] = []
+    issues: List[Dict[str, str]] = []
+    failure = ""
+    batch = ""
+
+    if undo:
+        if plan_value or apply:
+            raise WorkspaceError("--undo 不能与 --plan 或 --apply 同时使用")
+        if not moves:
+            raise WorkspaceError("没有可撤销的移动记录")
+        batch = moves[-1][0]
+        kept = [item for item in moves if item[0] != batch]
+        pending = [item for item in moves if item[0] == batch]
+        while pending and not failure:
+            _, old, new = pending[-1]
+            old_path = root.joinpath(*old.split("/"))
+            new_path = root.joinpath(*new.split("/"))
+            if not os.path.lexists(str(new_path)) or os.path.lexists(str(old_path)):
+                failure = "{} 无法移回 {}：现位置不存在或原位置已被占用".format(new, old)
+                break
+            try:
+                old_path.parent.mkdir(parents=True, exist_ok=True)
+                os.rename(str(new_path), str(old_path))
+            except OSError as exc:
+                failure = "{} 无法移回 {}: {}".format(new, old, exc)
+                break
+            pending.pop()
+            done.append((new, old))
+        write_moves(root, kept + pending)
+    else:
+        if not plan_value:
+            raise WorkspaceError("move 需要 --plan <计划文件> 或 --undo")
+        plan = Path(plan_value).expanduser()
+        if not plan.is_absolute():
+            plan = root / plan
+        if not plan.is_file():
+            raise WorkspaceError("计划文件不存在: {}".format(plan))
+        pairs, issues = parse_move_plan(root, plan)
+        if apply and not issues:
+            stamp = _datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            used = {item[0] for item in moves}
+            batch, suffix = stamp, 1
+            while batch in used:
+                suffix += 1
+                batch = "{}-{}".format(stamp, suffix)
+            for source, target in pairs:
+                source_path = root.joinpath(*source.split("/"))
+                target_path = root.joinpath(*target.split("/"))
+                try:
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    os.rename(str(source_path), str(target_path))
+                except OSError as exc:
+                    failure = "{} -> {}: {}".format(source, target, exc)
+                    break
+                moves.append((batch, source, target))
+                done.append((source, target))
+            if done:
+                write_moves(root, moves)
+        planned = len(pairs)
+
+    ok = not issues and not failure
+    if json_output:
+        print(
+            json.dumps(
+                {
+                    "ok": ok,
+                    "applied": bool(done),
+                    "batch": batch,
+                    "moved": [{"from": source, "to": target} for source, target in done],
+                    "errors": issues + ([make_issue("move_failed", "", failure)] if failure else []),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        print_issues(issues, [])
+        if issues:
+            print("计划有 {} 个问题，未移动任何内容。".format(len(issues)))
+        elif undo:
+            print("已撤销批次 {} 中的 {} 项移动。".format(batch, len(done)))
+        elif apply:
+            print("已移动 {} 项，批次 {}，记录在 .agents/{}。".format(len(done), batch, MOVES_FILE))
+        else:
+            print("计划有效，共 {} 项；未移动。确认后加 --apply 执行。".format(planned))
+        if failure:
+            print("中途停止: {}。已完成的部分保留在记录中。".format(failure))
+    if failure:
+        return 2
+    return 0 if ok else 1
+
+
+def scan_command(root: Path, limit: int, write_allowlist: bool, json_output: bool, subpath: Optional[str] = None) -> int:
+    """清点根目录（或指定子目录）的直接子项，供整理已有工作区时使用；默认只读。"""
+    defaults = {item.casefold() for item in DEFAULT_ROOT_ENTRIES}
+    allowlisted, adopted_roots = registered_root_names(root)
+    directories: List[Dict[str, object]] = []
+    files: List[Dict[str, object]] = []
+    needles = abspath_needles(root)
+    base = root
+    if subpath:
+        rel = normalize_rel(root, subpath)
+        if rel is None or not root.joinpath(*rel.split("/")).is_dir():
+            raise WorkspaceError("scan 的路径必须是工作区内的目录: {}".format(subpath))
+        if write_allowlist:
+            raise WorkspaceError("--write-allowlist 只用于根目录")
+        base = root.joinpath(*rel.split("/"))
+        defaults = set()
+        allowlisted, adopted_roots = set(), set()
+    try:
+        with os.scandir(base) as iterator:
+            root_entries = sorted(iterator, key=lambda item: item.name.casefold())
+    except OSError as exc:
+        raise WorkspaceError("无法读取目录 {}: {}".format(base, exc)) from exc
+
+    for entry in root_entries:
+        key = entry.name.casefold()
+        if key in defaults:
+            continue
+        if subpath:
+            state = "listed"
+        elif key in adopted_roots:
+            state = "adopted"
+        elif key in allowlisted:
+            state = "allowlisted"
+        else:
+            state = "unregistered"
+        if entry.is_dir(follow_symlinks=False):
+            item: Dict[str, object] = {"name": entry.name, "state": state}
+            item.update(summarize_directory(Path(entry.path), root, needles))
+            directories.append(item)
+        else:
+            try:
+                stat = entry.stat(follow_symlinks=False)
+                size, modified = stat.st_size, format_date(stat.st_mtime)
+            except OSError:
+                size, modified = 0, "-"
+            mentions = bool(needles) and size <= ABSPATH_MAX_BYTES and file_mentions(entry.path, needles)
+            files.append(
+                {
+                    "name": entry.name,
+                    "state": state,
+                    "bytes": size,
+                    "modified": modified,
+                    "markers": ["abspath"] if mentions else [],
+                }
+            )
+
+    directories.sort(key=lambda item: str(item["name"]).casefold())
+    directories.sort(key=lambda item: str(item["modified"]), reverse=True)
+    files.sort(key=lambda item: str(item["name"]).casefold())
+    files.sort(key=lambda item: str(item["modified"]), reverse=True)
+    unregistered = sorted(
+        (str(item["name"]) for item in directories + files if item["state"] == "unregistered"),
+        key=str.casefold,
+    )
+
+    written = 0
+    if write_allowlist and unregistered:
+        path = root / ".agents" / ALLOWLIST_FILE
+        if path.exists():
+            text = read_text(path)
+            eol = detect_eol(text)
+            if text and not text.endswith(("\n", "\r")):
+                text += eol
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            eol = "\n"
+            text = "# 根目录允许条目" + eol + "# 每行一个根目录直接子项名称；空行和以 # 开头的行会忽略。" + eol
+        text += eol.join(unregistered) + eol
+        atomic_write(path, text)
+        written = len(unregistered)
+        for item in directories + files:
+            if item["state"] == "unregistered":
+                item["state"] = "allowlisted"
+
+    if json_output:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "directories": directories[:limit],
+                    "files": files[:limit],
+                    "directory_count": len(directories),
+                    "file_count": len(files),
+                    "unregistered": unregistered,
+                    "written": written,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    state_label = {"adopted": "含原地主题", "allowlisted": "已记入白名单", "unregistered": "未登记", "listed": ""}
+    if subpath:
+        print("{}/ 的直接内容：目录 {} 个，文件 {} 个。".format(relative_path(root, base), len(directories), len(files)))
+    else:
+        print(
+            "根目录清单（不含工作区管理文件）：目录 {} 个，文件 {} 个，未登记 {} 个。".format(
+                len(directories), len(files), len(unregistered)
+            )
+        )
+    if directories:
+        print(
+            "目录（最近修改在前；标记 git=仓库 project=含项目清单 agent=含 AI 规则或技能文件 "
+            "env=含虚拟环境 cache=缓存目录 abspath=有文件写死了本工作区的绝对路径）:"
+        )
+        for item in directories[:limit]:
+            count = "{}{}".format(item["files"], "+" if item["truncated"] else "")
+            markers = " [{}]".format(", ".join(item["markers"])) if item["markers"] else ""
+            print(
+                "- {}/  {} 个文件  {}  {}{}  {}".format(
+                    item["name"],
+                    count,
+                    format_size(int(item["bytes"])),
+                    item["modified"],
+                    markers,
+                    state_label[str(item["state"])],
+                )
+            )
+            if item["abspath_files"]:
+                print(
+                    "  写死绝对路径的文件 {} 个，例如：{}".format(
+                        item["abspath_files"], "、".join(str(value) for value in item["abspath_examples"])
+                    )
+                )
+        if len(directories) > limit:
+            print("  …另有 {} 个目录未列出，可用 --limit 调整。".format(len(directories) - limit))
+    if files:
+        print("文件:")
+        for item in files[:limit]:
+            markers = " [{}]".format(", ".join(item["markers"])) if item["markers"] else ""
+            print(
+                "- {}  {}  {}{}  {}".format(
+                    item["name"],
+                    format_size(int(item["bytes"])),
+                    item["modified"],
+                    markers,
+                    state_label[str(item["state"])],
+                )
+            )
+        if len(files) > limit:
+            print("  …另有 {} 个文件未列出，可用 --limit 调整。".format(len(files) - limit))
+    if written:
+        print("已把 {} 个未登记条目追加到 .agents/{}，未移动任何内容。".format(written, ALLOWLIST_FILE))
+    elif unregistered:
+        print("未写入；确认后使用 scan --write-allowlist 把未登记条目记入白名单（保持原位）。")
+    return 0
+
+
 def resolve_root(value: Optional[str]) -> Path:
     path = Path(value).expanduser() if value else Path(__file__).resolve().parent.parent.parent
     try:
@@ -887,10 +1487,29 @@ def build_parser() -> argparse.ArgumentParser:
     index.add_argument("--json", action="store_true", dest="json_output")
     index.add_argument("--root", default=argparse.SUPPRESS)
 
-    find = subparsers.add_parser("find", help="按标题、别名、标签、目录名查找主题")
+    find = subparsers.add_parser("find", help="按标题、别名、标签、目录名或登记路径查找主题")
     find.add_argument("query")
     find.add_argument("--json", action="store_true", dest="json_output")
     find.add_argument("--root", default=argparse.SUPPRESS)
+
+    where = subparsers.add_parser("where", help="按移动记录查询旧路径现在的位置")
+    where.add_argument("paths", nargs="+")
+    where.add_argument("--json", action="store_true", dest="json_output")
+    where.add_argument("--root", default=argparse.SUPPRESS)
+
+    move = subparsers.add_parser("move", help="按计划移动已有内容并写入移动记录；默认只校验")
+    move.add_argument("--plan", help="计划文件：每行“原路径<TAB>新路径”")
+    move.add_argument("--apply", action="store_true", help="校验通过后执行移动")
+    move.add_argument("--undo", action="store_true", help="撤销最近一批移动")
+    move.add_argument("--json", action="store_true", dest="json_output")
+    move.add_argument("--root", default=argparse.SUPPRESS)
+
+    scan = subparsers.add_parser("scan", help="清点根目录或指定子目录的直接内容（整理已有工作区时使用）")
+    scan.add_argument("path", nargs="?", help="要清点的子目录；省略时清点根目录")
+    scan.add_argument("--limit", type=int, default=40, help="目录和文件各自最多列出的条数，默认 40")
+    scan.add_argument("--write-allowlist", action="store_true", help="把未登记的根目录条目追加到白名单，不移动内容")
+    scan.add_argument("--json", action="store_true", dest="json_output")
+    scan.add_argument("--root", default=argparse.SUPPRESS)
     return parser
 
 
@@ -917,6 +1536,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return index_command(root, args.write, args.json_output)
         if args.command == "find":
             return find_command(root, args.query, args.json_output)
+        if args.command == "scan":
+            return scan_command(root, max(args.limit, 0), args.write_allowlist, args.json_output, args.path)
+        if args.command == "where":
+            return where_command(root, args.paths, args.json_output)
+        if args.command == "move":
+            return move_command(root, args.plan, args.apply, args.undo, args.json_output)
         raise WorkspaceError("未知命令: {}".format(args.command))
     except WorkspaceError as exc:
         if getattr(args, "json_output", False):
